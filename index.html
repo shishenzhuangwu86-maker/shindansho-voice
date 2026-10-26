@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>音声入力(診断書)</title>
+<style>
+  :root { --bg:#f3f4f6; --fg:#111; --card:#fff; --line:#ddd; --accent:#dc2626; --muted:#555; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111827; --fg:#f9fafb; --card:#1f2937; --line:#374151; --muted:#9ca3af; } }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:14px; font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif; background:var(--bg); color:var(--fg); transition:background .3s; }
+  body.listening { background:#fee2e2; }
+  @media (prefers-color-scheme: dark) { body.listening { background:#3b0d0d; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; max-width:520px; margin:0 auto; }
+  /* 状態表示 */
+  .state { display:flex; align-items:center; gap:12px; padding:14px; border-radius:10px; background:#f3f4f6; margin-bottom:12px; }
+  @media (prefers-color-scheme: dark) { .state { background:#111827; } }
+  .listening .state { background:#fecaca; color:#7f1d1d; }
+  .dot { width:18px; height:18px; border-radius:50%; background:#9ca3af; flex:none; }
+  .listening .dot { background:var(--accent); animation:pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { transform:scale(1); box-shadow:0 0 0 0 rgba(220,38,38,.6);} 50% { transform:scale(1.15); box-shadow:0 0 0 12px rgba(220,38,38,0);} }
+  .state b { font-size:20px; }
+  .state .sub { font-size:13px; color:var(--muted); }
+  .listening .state .sub { color:#991b1b; }
+  .time { margin-left:auto; font-size:22px; font-variant-numeric:tabular-nums; }
+  /* 声の大きさメーター */
+  .meter { display:flex; gap:3px; align-items:flex-end; height:34px; margin:0 0 12px; padding:0 4px; }
+  .meter i { flex:1; background:#d1d5db; border-radius:2px; height:4px; transition:height .08s; }
+  .listening .meter i.on { background:var(--accent); }
+  .quiet { font-size:13px; color:#b45309; min-height:18px; margin-bottom:6px; }
+  button { font:inherit; width:100%; padding:18px; font-size:19px; border-radius:12px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  button.on { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:bold; }
+  button.send { margin-top:10px; background:#2563eb; color:#fff; border-color:#2563eb; font-size:16px; padding:12px; }
+  #text { margin-top:12px; min-height:120px; max-height:40vh; overflow:auto; white-space:pre-wrap; border:1px dashed var(--line); border-radius:8px; padding:10px; font-size:15px; line-height:1.6; }
+  .interim { color:var(--muted); }
+  .interim::after { content:"▍"; animation:blink 1s step-end infinite; }
+  @keyframes blink { 50% { opacity:0; } }
+  .note { font-size:12px; color:var(--muted); margin-top:10px; line-height:1.6; }
+  .err { color:#dc2626; font-size:14px; margin-top:8px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="state">
+    <div class="dot"></div>
+    <div><b id="stTitle">準備中…</b><div class="sub" id="stSub">マイクの許可を確認しています</div></div>
+    <div class="time" id="time"></div>
+  </div>
+  <div class="meter" id="meter"></div>
+  <div class="quiet" id="quiet"></div>
+  <button id="rec">● 話しはじめる</button>
+  <div id="text"></div>
+  <button id="send" class="send" hidden>この内容を診断書に入れる</button>
+  <div class="err" id="err"></div>
+  <div class="note">赤く点滅している間は聞いています(診察のあいだ開いたままでOK・長くても止まりません)。端末は先生と患者さんの間、口から50cm以内が目安です。診察が終わったら赤いボタンを押すと診断書の画面に入り、この窓は閉じます。</div>
+</div>
+<script>
+// 開いた診断書画面(Googleの枠)へだけ結果を返す
+const params = new URLSearchParams(location.search);
+const target = params.get("o") || "";
+const okTarget = /^https:\/\/[a-z0-9-]+-script\.googleusercontent\.com$/.test(target);
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const $ = s => document.querySelector(s);
+let recog = null, finalText = "", listening = false, stopping = false, startedAt = 0, timer = null, lastVoice = 0;
+
+// 声の大きさメーター(マイクの音量を棒で表示)
+const BARS = 24;
+for (let i = 0; i < BARS; i++) $("#meter").append(document.createElement("i"));
+let audioCtx = null, analyser = null, stream = null;
+async function startMeter() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser(); analyser.fftSize = 256;
+    audioCtx.createMediaStreamSource(stream).connect(analyser);
+    const buf = new Uint8Array(analyser.frequencyBinCount);
+    const bars = [...$("#meter").children];
+    (function loop() {
+      if (!analyser) return;
+      analyser.getByteTimeDomainData(buf);
+      let sum = 0; for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
+      const rms = Math.sqrt(sum / buf.length);
+      const lit = Math.min(BARS, Math.round(rms * 60));
+      if (lit >= 3) lastVoice = Date.now();
+      bars.forEach((b, i) => { const on = listening && i < lit; b.classList.toggle("on", on); b.style.height = (on ? 6 + Math.min(28, i * 1.3 + rms * 40) : 4) + "px"; });
+      requestAnimationFrame(loop);
+    })();
+  } catch (e) { /* メーターが無くても音声認識は動く */ }
+}
+function stopMeter() { try { stream && stream.getTracks().forEach(t => t.stop()); audioCtx && audioCtx.close(); } catch (e) {} analyser = null; }
+
+function setState(title, sub) { $("#stTitle").textContent = title; $("#stSub").textContent = sub || ""; }
+function tick() {
+  const s = Math.floor((Date.now() - startedAt) / 1000);
+  $("#time").textContent = `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+  $("#quiet").textContent = listening && Date.now() - lastVoice > 6000 ? "声が届いていないようです。マイクに近づいて話してください。" : "";
+}
+function render(interim) {
+  $("#text").innerHTML = "";
+  $("#text").append(document.createTextNode(finalText));
+  if (interim) { const s = document.createElement("span"); s.className = "interim"; s.textContent = interim; $("#text").append(s); }
+  $("#text").scrollTop = $("#text").scrollHeight;
+  $("#send").hidden = !finalText;
+}
+function send() {
+  if (!finalText) return;
+  if (!window.opener || !okTarget) { $("#err").textContent = "診断書の画面が見つかりません。下の文字をコピーして②に貼ってください。"; return; }
+  window.opener.postMessage({ type: "shindansho-voice", text: finalText }, target);
+  window.close();
+}
+function notify(kind) { try { if (window.opener && okTarget) window.opener.postMessage({ type: "shindansho-voice-state", state: kind }, target); } catch (e) {} }
+
+function startRecog() {
+  recog = new SR();
+  recog.lang = "ja-JP"; recog.continuous = true; recog.interimResults = true;
+  recog.onresult = ev => {
+    let interim = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      if (ev.results[i].isFinal) finalText += ev.results[i][0].transcript + "。";
+      else interim += ev.results[i][0].transcript;
+    }
+    lastVoice = Date.now();
+    render(interim);
+  };
+  recog.onerror = ev => {
+    if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
+      listening = false; stopping = true;
+      $("#err").textContent = "マイクが許可されていません。アドレスバー左の鍵マークから「マイク」を許可して、もう一度押してください。";
+      setState("マイクが使えません", "許可してからもう一度押してください");
+    } else if (ev.error !== "no-speech" && ev.error !== "aborted") {
+      $("#err").textContent = "音声入力エラー(" + ev.error + ")";
+    }
+  };
+  recog.onend = () => {
+    recog = null;
+    // 無音などで勝手に止まったら、話し終わりボタンを押すまで自動で聞き直す
+    if (listening && !stopping) { try { startRecog(); return; } catch (e) {} }
+    stopListening(stopping && finalText);
+  };
+  recog.start();
+}
+function start() {
+  if (!SR) { setState("この端末では使えません", "Chrome か Safari で開いてください"); $("#err").textContent = "このブラウザは音声入力に対応していません。"; return; }
+  $("#err").textContent = "";
+  listening = true; stopping = false; startedAt = Date.now(); lastVoice = Date.now();
+  document.body.classList.add("listening");
+  setState("🎙 聞いています", "診察のあいだ、このまま開いておいてください");
+  $("#rec").classList.add("on"); $("#rec").textContent = "■ 話し終わったら押す";
+  clearInterval(timer); timer = setInterval(tick, 500); tick();
+  notify("listening");
+  startRecog();
+}
+function stopListening(doSend) {
+  listening = false; clearInterval(timer);
+  document.body.classList.remove("listening");
+  $("#rec").classList.remove("on"); $("#rec").textContent = "● 続けて話す";
+  setState("止まっています", finalText ? "続けて話すか、下の青いボタンで診断書に入れます" : "ボタンを押すと聞きはじめます");
+  $("#quiet").textContent = "";
+  render("");
+  notify("stopped");
+  if (doSend) send();
+}
+$("#rec").onclick = () => { if (listening) { stopping = true; setState("まとめています…", "少しお待ちください"); if (recog) recog.stop(); else stopListening(!!finalText); } else start(); };
+$("#send").onclick = send;
+window.addEventListener("beforeunload", () => { stopMeter(); notify("closed"); });
+if (!okTarget) { setState("開き方が違います", "診断書の画面の🎙ボタンから開いてください"); $("#err").textContent = "診断書の画面の🎙ボタンから開いてください。"; }
+else { startMeter(); start(); }
+</script>
+</body>
+</html>
